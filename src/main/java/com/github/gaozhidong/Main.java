@@ -52,7 +52,7 @@ public class Main {
         }
     }
 
-    private static Document httpgetPaseHtml(String link) {
+    private static Document httpgetPaseHtml(String link) throws IOException {
         CloseableHttpClient httpclient = HttpClients.createDefault();
         HttpGet httpGet = new HttpGet("https://sina.cn");
         try (CloseableHttpResponse response1 = httpclient.execute(httpGet)) {
