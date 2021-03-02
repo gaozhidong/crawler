@@ -10,73 +10,69 @@ import org.apache.http.util.EntityUtils;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
 
+import java.io.File;
 import java.io.IOException;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
-import java.util.ArrayList;
-import java.util.List;
+
+import java.util.stream.Collectors;
 
 public class Main {
-    private static final String USER_NAME = "root";
+    private static final String USERNAME = "root";
     private static final String PASSWORD = "root";
-
 
 
     @SuppressFBWarnings("DMI_CONSTANT_DB_PASSWORD")
     public static void main(String[] args) throws IOException, SQLException {
-        Connection connection = DriverManager.getConnection("jdbc:h2:file:/Volumes/projects/userProjects/crawler/news", USER_NAME, PASSWORD);
-
-        while (true) {
-            // 待处理的链接
-            List<String> linkPool = loadUrlFromDatabase(connection, "SELECT * FROM LINKS_TO_BE_PROCESSED");
-
-            if (linkPool.isEmpty()) {
-                break;
-            }
-            String link = linkPool.remove(linkPool.size() - 1);
-            insertLinkIntoDatabases(connection, link, "DELETE FROM LINKS_TO_BE_PROCESSED WHERE link = ?");
-            if (isLinkProcessed(connection, link)) {
-                continue;
-            }
-            if (isInterestingLink(link)) {
-                Document doc = httpgetPaseHtml(link);
-                parseUrlsFromPageAndStoreIntoDatabases(connection, doc);
-                storeIntoDatabaseItIsNewsPage(doc);
-                insertLinkIntoDatabases(connection, link, "INSERT INTO LINKS_ALREADY_PROCESSED (link) VALUES  (?)");
+        File projectDir = new File(System.getProperty("basedir", System.getProperty("user.dir")));
+        Connection connection = DriverManager.getConnection("jdbc:h2:file:" + new File(projectDir, "news"), USERNAME, PASSWORD);
+        String link;
+        while ((link = getNextLinkThenDelete(connection)) != null) {
+            // 确保当前链接没有被处理
+            if (!isLinkProcessed(connection, link)) {
+                System.out.println(link);
+                Document doc = httpGetAndParseHtml(link);
+                parseUrlsFromPageAndStoreIntoDatabase(connection, doc);
+                storeIntoDatabaseIfItIsNewsPage(connection, doc, link);
+                updateLinkIntoDatabase(connection, link, "insert into LINKS_ALREADY_PROCESSED (link) values (?)");
             }
         }
     }
 
-    private static List<String> loadUrlFromDatabase(Connection connection, String sql) throws SQLException {
-        List<String> results = new ArrayList<>();
-        ResultSet resultSet = null;
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
-            resultSet = statement.executeQuery();
+    private static String getNextLinkThenDelete(Connection connection) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("select link from LINKS_TO_BE_PROCESSED limit 1");
+             ResultSet resultSet = statement.executeQuery()
+        ) {
             while (resultSet.next()) {
-                results.add(resultSet.getString(1));
-            }
-        } finally {
-            if (resultSet != null) {
-                resultSet.close();
+                String link = resultSet.getString(1);
+                updateLinkIntoDatabase(connection, link, "delete from LINKS_TO_BE_PROCESSED where link = ?");
+                return link;
             }
         }
-        return results;
+        return null;
     }
 
-    private static void parseUrlsFromPageAndStoreIntoDatabases(Connection connection, Document doc) throws SQLException {
+    private static void parseUrlsFromPageAndStoreIntoDatabase(Connection connection, Document doc) throws SQLException {
         for (Element aTag : doc.select("a")) {
-            String href = aTag.attr("href");
-            insertLinkIntoDatabases(connection, href, "INSERT INTO LINKS_TO_BE_PROCESSED (link) VALUES (?) ");
+            String link = aTag.attr("href");
+            // 只处理感兴趣的链接
+            if (isInterestingLink(link)) {
+                if (link.startsWith("//")) {
+                    link = "https:" + link;
+                }
+                updateLinkIntoDatabase(connection, link, "insert into LINKS_TO_BE_PROCESSED (link) values (?)");
+            }
         }
     }
 
     private static boolean isLinkProcessed(Connection connection, String link) throws SQLException {
         ResultSet resultSet = null;
-        try (PreparedStatement statement = connection.prepareStatement("SELECT LINK FROM LINKS_ALREADY_PROCESSED WHENEVER link")) {
+        try (PreparedStatement statement = connection.prepareStatement("select link from LINKS_ALREADY_PROCESSED where link = ?")) {
             statement.setString(1, link);
             resultSet = statement.executeQuery();
             while (resultSet.next()) {
@@ -90,52 +86,63 @@ public class Main {
         return false;
     }
 
-    private static void insertLinkIntoDatabases(Connection connection, String link, String sql) throws SQLException {
+    private static void updateLinkIntoDatabase(Connection connection, String link, String sql) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, link);
             statement.executeUpdate();
         }
     }
 
-    private static void storeIntoDatabaseItIsNewsPage(Document doc) {
-        ArrayList<Element> articleTags = doc.select("article");
-
+    private static void storeIntoDatabaseIfItIsNewsPage(Connection connection, Document doc, String link) throws SQLException {
+        Elements articleTags = doc.select("article");
         if (!articleTags.isEmpty()) {
             for (Element articleTag : articleTags) {
                 String title = articleTags.get(0).child(0).text();
                 System.out.println(title);
+                String content = articleTag.select("p").stream().map(Element::text).collect(Collectors.joining("\n"));
+
+                try (PreparedStatement statement = connection.prepareStatement("insert into NEWS (title, content, url, created_at, updated_at) values (?, ?, ?, now(), now())")) {
+                    statement.setString(1, title);
+                    statement.setString(2, content);
+                    statement.setString(3, link);
+                    statement.executeUpdate();
+                }
             }
         }
     }
 
-    private static Document httpgetPaseHtml(String link) throws IOException {
+    private static Document httpGetAndParseHtml(String link) {
         CloseableHttpClient httpclient = HttpClients.createDefault();
-        HttpGet httpGet = new HttpGet("https://sina.cn");
+        HttpGet httpGet = new HttpGet(link);
+        httpGet.addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.120 Safari/537.36");
+        String html = "";
         try (CloseableHttpResponse response1 = httpclient.execute(httpGet)) {
-            System.out.println(link);
-            System.out.println(response1.getStatusLine());
-
-            HttpEntity entity1 = response1.getEntity();
-            String html = EntityUtils.toString(entity1);
-            return Jsoup.parse(html);
-
+            HttpEntity entity1;
+            entity1 = response1.getEntity();
+            html = EntityUtils.toString(entity1);
+        } catch (IOException e) {
+            e.printStackTrace();
         }
+        return Jsoup.parse(html);
     }
 
     private static boolean isInterestingLink(String link) {
-        return (isNewsPage(link) || isIndexPage(link) &&
-                isNotLoginPage(link));
-    }
-
-    private static boolean isIndexPage(String link) {
-        return "https://sina.cn".equals(link);
+        return (isNewsPage(link) || isIndexPage(link)) && isNotLoginPage(link) && isLegalUrl(link);
     }
 
     private static boolean isNewsPage(String link) {
         return link.contains("news.sina.cn");
     }
 
+    private static boolean isIndexPage(String link) {
+        return "https://sina.cn".equals(link);
+    }
+
     private static boolean isNotLoginPage(String link) {
         return !link.contains("passport.sina.cn");
+    }
+
+    private static boolean isLegalUrl(String link) {
+        return link.startsWith("https://") || link.startsWith("http://") || link.startsWith("//");
     }
 }
